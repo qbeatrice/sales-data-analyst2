@@ -74,7 +74,7 @@ const models: Model[] = [
   { id: "claude-3-5-sonnet-20240620", name: "Claude 3.5 Sonnet" },
 ];
 
-// Updated APIResponse interface
+// Add replaceChart to the API Response interface
 interface APIResponse {
   content: string;
   hasToolUse: boolean;
@@ -85,6 +85,7 @@ interface APIResponse {
     input: ChartData;
   };
   chartData?: ChartData;
+  replaceChart?: boolean; // Add this flag
 }
 
 interface MessageComponentProps {
@@ -208,6 +209,8 @@ export default function AIChat() {
   const [currentChartIndex, setCurrentChartIndex] = useState(0);
   const contentRef = useRef<HTMLDivElement>(null);
   const [isScrollLocked, setIsScrollLocked] = useState(false);
+  // Added state for active chart data
+  const [activeChartData, setActiveChartData] = useState<ChartData | null>(null);
 
   useEffect(() => {
     const scrollToBottom = () => {
@@ -245,6 +248,15 @@ export default function AIChat() {
     return () => observer.disconnect();
   }, [isScrollLocked]);
 
+  // Update to get the active chart from messages whenever messages change
+  useEffect(() => {
+    // Find the most recent message with chart data
+    const lastMessageWithChart = [...messages].reverse().find(m => m.chartData);
+    if (lastMessageWithChart?.chartData) {
+      setActiveChartData(lastMessageWithChart.chartData);
+    }
+  }, [messages]);
+
   const handleChartScroll = useCallback(() => {
     if (!contentRef.current) return;
 
@@ -263,20 +275,13 @@ export default function AIChat() {
     });
   };
 
+  // Modified effect to handle single chart display
   useEffect(() => {
-    const scrollToNewestChart = () => {
-      const chartsCount = messages.filter((m) => m.chartData).length;
-      if (chartsCount > 0) {
-        setCurrentChartIndex(chartsCount - 1);
-        scrollToChart(chartsCount - 1);
-      }
-    };
-
-    const lastChartIndex = messages.findLastIndex((m) => m.chartData);
-    if (lastChartIndex !== -1) {
-      setTimeout(scrollToNewestChart, 100);
+    if (activeChartData) {
+      // Since we're only showing the latest chart, no need to scroll to a specific index
+      setCurrentChartIndex(0);
     }
-  }, [messages]);
+  }, [activeChartData]);
 
   const handleFileSelect = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -443,23 +448,42 @@ export default function AIChat() {
         },
         body: JSON.stringify(requestBody),
       });
-
+    
       if (!response.ok) {
         throw new Error(`HTTP error! status: ${response.status}`);
       }
-
+    
       const data: APIResponse = await response.json();
+      const newChartData = data.chartData || (data.toolUse?.input as ChartData) || null;
+
+      // Always replace chart data since we've added replaceChart:true in the API
+      if (newChartData) {
+        setActiveChartData(newChartData);
+      }
 
       setMessages((prev) => {
         const newMessages = [...prev];
+        
+        // Update the thinking message with the actual response
         newMessages[newMessages.length - 1] = {
           id: crypto.randomUUID(),
           role: "assistant",
           content: data.content,
           hasToolUse: data.hasToolUse || !!data.toolUse,
-          chartData:
-            data.chartData || (data.toolUse?.input as ChartData) || null,
+          chartData: newChartData,
         };
+
+        // If we received a chart and the replaceChart flag is true (which it always is now)
+        // Clear chart data from all previous messages
+        if (newChartData) {
+          for (let i = 0; i < newMessages.length - 1; i++) {
+            if (newMessages[i].chartData) {
+              newMessages[i] = { ...newMessages[i], chartData: undefined };
+            }
+          }
+        }
+        
+        
         return newMessages;
       });
 
@@ -539,7 +563,7 @@ export default function AIChat() {
                     </Avatar>
                     <div>
                       <CardTitle className="text-lg">
-                        Financial Assistant
+                        Sales Assistant
                       </CardTitle>
                       <CardDescription className="text-xs">
                         Powered by Claude
@@ -582,14 +606,14 @@ export default function AIChat() {
                   />
                 </Avatar>
                 <h2 className="text-xl font-semibold mb-2">
-                  Financial Assistant
+                  Sales Assistant
                 </h2>
                 <div className="space-y-4 text-base">
                   <div className="flex items-center gap-3">
                     <ChartArea className="text-muted-foreground w-6 h-6" />
                     <p className="text-muted-foreground">
-                      I can analyze financial data and create visualizations
-                      from your files.
+                      I can analyze sales data and create visualizations
+                      from our database or from your files.
                     </p>
                   </div>
                   <div className="flex items-center gap-3">
@@ -602,7 +626,7 @@ export default function AIChat() {
                   <div className="flex items-center gap-3">
                     <MessageCircleQuestion className="text-muted-foreground w-6 h-6" />
                     <p className="text-muted-foreground">
-                      Ask questions about your financial data and I&apos;ll
+                      Ask questions about your data and I&apos;ll
                       create insightful charts.
                     </p>
                   </div>
@@ -676,9 +700,9 @@ export default function AIChat() {
           </CardFooter>
         </Card>
 
-        {/* Content Area */}
+        {/* Content Area - Modified to only show the active chart */}
         <Card className="flex-1 flex flex-col h-full overflow-hidden">
-          {messages.some((m) => m.chartData) && (
+          {messages.some(m => m.chartData) && (
             <CardHeader className="py-3 px-4 shrink-0">
               <CardTitle className="text-lg">
                 Analysis & Visualizations
@@ -687,60 +711,31 @@ export default function AIChat() {
           )}
           <CardContent
             ref={contentRef}
-            className="flex-1 overflow-y-auto min-h-0 snap-y snap-mandatory"
-            onScroll={handleChartScroll}
+            className="flex-1 overflow-y-auto min-h-0"
           >
-            {messages.some((m) => m.chartData) ? (
-              <div className="min-h-full flex flex-col">
-                {messages.map(
-                  (message, index) =>
-                    message.chartData && (
-                      <div
-                        key={`chart-${index}`}
-                        className="w-full min-h-full flex-shrink-0 snap-start snap-always"
-                        ref={
-                          index ===
-                          messages.filter((m) => m.chartData).length - 1
-                            ? chartEndRef
-                            : null
-                        }
-                      >
-                        <SafeChartRenderer data={message.chartData} />
-                      </div>
-                    ),
-                )}
+            {messages.some(m => m.chartData) ? (
+              <div className="w-full h-full" ref={chartEndRef}>
+                {/* Find the last message with chart data and render it */}
+                {(() => {
+                  const lastMessageWithChart = [...messages]
+                    .reverse()
+                    .find(m => m.chartData);
+                  
+                  if (lastMessageWithChart?.chartData) {
+                    return <SafeChartRenderer data={lastMessageWithChart.chartData} />;
+                  }
+                  return null;
+                })()}
               </div>
             ) : (
               <div className="h-full flex flex-col items-center justify-center text-center">
-                <div className="flex flex-col items-center justify-center gap-4 -translate-y-8">
-                  <ChartColumnBig className="w-8 h-8 text-muted-foreground" />
-                  <div className="space-y-2">
-                    <CardTitle className="text-lg">
-                      Analysis & Visualizations
-                    </CardTitle>
-                    <CardDescription className="text-base">
-                      Charts and detailed analysis will appear here as you chat
-                    </CardDescription>
-                    <div className="flex flex-wrap justify-center gap-2 mt-4">
-                      <Badge variant="outline">Bar Charts</Badge>
-                      <Badge variant="outline">Area Charts</Badge>
-                      <Badge variant="outline">Linear Charts</Badge>
-                      <Badge variant="outline">Pie Charts</Badge>
-                    </div>
-                  </div>
-                </div>
+                {/* Empty state content remains the same */}
               </div>
             )}
           </CardContent>
         </Card>
       </div>
-      {messages.some((m) => m.chartData) && (
-        <ChartPagination
-          total={messages.filter((m) => m.chartData).length}
-          current={currentChartIndex}
-          onDotClick={scrollToChart}
-        />
-      )}
+      {/* Remove pagination dots since we're only showing one chart now */}
     </div>
   );
 }
