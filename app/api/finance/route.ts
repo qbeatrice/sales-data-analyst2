@@ -20,6 +20,335 @@ const isValidBase64 = (str: string) => {
   }
 };
 
+/**
+ * Generates an optimized chart configuration using Claude's analysis
+ * @param queryData - The raw data returned from the database query
+ * @param nlQuery - The natural language query that generated the data
+ * @param chartType - Optional suggested chart type (will be determined automatically if not provided)
+ * @returns A complete chart configuration optimized for Recharts
+ */
+async function generateOptimizedChart(
+  queryData: any[],
+  nlQuery: string,
+  chartType?: string
+): Promise<ChartData> {
+  console.log("🎨 Generating optimized chart with dedicated Claude agent...");
+  
+  if (!queryData || !queryData.length) {
+    console.error("Cannot generate chart: No data provided");
+    throw new Error("Cannot generate chart: No data provided");
+  }
+
+  // Initialize Anthropic client with correct headers (reusing existing client setup)
+  const chartGenerator = new Anthropic({
+    apiKey: process.env.ANTHROPIC_API_KEY!,
+  });
+
+  // Create a sample of the data to include in the prompt
+  const dataSample = JSON.stringify(
+    queryData.length > 15 ? queryData.slice(0, 15) : queryData, 
+    null, 
+    2
+  );
+
+  // Get data structure information
+  const dataKeys = Object.keys(queryData[0]);
+  const dataTypes: Record<string, string> = {};
+  
+  // Analyze data types for each column
+  dataKeys.forEach(key => {
+    const values = queryData.map(item => item[key]).filter(v => v !== null && v !== undefined);
+    
+    if (values.length === 0) {
+      dataTypes[key] = 'unknown';
+      return;
+    }
+    
+    const firstValue = values[0];
+    
+    if (typeof firstValue === 'number') {
+      dataTypes[key] = 'number';
+    } else if (typeof firstValue === 'string') {
+      // Check if it might be a date
+      if (firstValue.match(/^\d{4}-\d{2}-\d{2}/) || 
+          firstValue.match(/^\d{1,2}\/\d{1,2}\/\d{4}/) ||
+          !isNaN(Date.parse(firstValue))) {
+        dataTypes[key] = 'date';
+      } else {
+        dataTypes[key] = 'string';
+      }
+    } else if (typeof firstValue === 'boolean') {
+      dataTypes[key] = 'boolean';
+    } else {
+      dataTypes[key] = typeof firstValue;
+    }
+  });
+
+  // Calculate some basic statistics for numeric fields to help with axis scaling
+  const numericStats: Record<string, {min: number, max: number, avg: number}> = {};
+  
+  dataKeys.forEach(key => {
+    if (dataTypes[key] === 'number') {
+      const values = queryData.map(item => item[key]).filter(v => v !== null && v !== undefined) as number[];
+      
+      if (values.length > 0) {
+        const min = Math.min(...values);
+        const max = Math.max(...values);
+        const sum = values.reduce((acc, val) => acc + val, 0);
+        const avg = sum / values.length;
+        
+        numericStats[key] = {
+          min,
+          max,
+          avg
+        };
+      }
+    }
+  });
+
+  // Check for categorical data to help determine chart type
+  const stringColumns = dataKeys.filter(key => dataTypes[key] === 'string');
+  const numberColumns = dataKeys.filter(key => dataTypes[key] === 'number');
+  const dateColumns = dataKeys.filter(key => dataTypes[key] === 'date');
+  
+  // Create the prompt for Claude to analyze the data and suggest a chart
+  const chartPrompt = `You are a data visualization expert assistant who specializes in creating Recharts configurations. 
+Your task is to analyze the following data and create a JSON configuration that will render an optimal chart in Recharts.
+
+Here is the data (showing ${queryData.length > 15 ? '15 of ' + queryData.length : queryData.length} rows):
+\`\`\`json
+${dataSample}
+\`\`\`
+
+Data types for each column:
+\`\`\`json
+${JSON.stringify(dataTypes, null, 2)}
+\`\`\`
+
+${Object.keys(numericStats).length > 0 ? `Statistics for numeric columns:
+\`\`\`json
+${JSON.stringify(numericStats, null, 2)}
+\`\`\`
+` : ''}
+
+This data was generated in response to this query: "${nlQuery}"
+${chartType ? `The suggested chart type is: ${chartType}` : ''}
+
+Create a complete chart configuration JSON object with the following structure:
+\`\`\`typescript
+interface ChartData {
+  chartType: string; // 'line', 'bar', 'pie', 'area', 'scatter', 'multibar'
+  data: any[]; // The optimized data format for the chart
+  config: {
+    xAxisKey: string; // The data key to use for the x-axis
+    title?: string; // Chart title
+    subtitle?: string; // Optional subtitle
+    stacked?: boolean; // Whether the chart should be stacked (for bar/area)
+    barSize?: number; // Size of bars (for bar charts)
+    legendPosition?: string; // 'top', 'right', 'bottom', 'left'
+    showGrid?: boolean; // Whether to show grid lines
+    showTooltip?: boolean; // Whether to show tooltips
+    tooltipFormatter?: string; // Javascript string function for formatting tooltips
+    xAxisLabel?: string; // Label for the X axis
+    yAxisLabel?: string; // Label for the Y axis
+    xAxisFormatter?: string; // Javascript string function for formatting X axis labels
+    yAxisFormatter?: string; // Javascript string function for formatting Y axis labels
+    margin?: { top: number, right: number, bottom: number, left: number };
+  };
+  chartConfig: {
+    [key: string]: { // One entry per data series
+      dataKey: string; // The data key for this series
+      name: string; // Display name for the series
+      color?: string; // Color for the series (use CSS color values)
+      fillOpacity?: number; // Opacity for filled areas (0-1)
+      strokeWidth?: number; // Width of lines
+      type?: string; // For combo charts: 'line', 'bar', etc.
+      yAxisId?: string; // For dual-axis charts
+      stackId?: string; // For stacked charts
+      tooltipFormatter?: string; // Javascript string function for custom series tooltip
+    };
+  };
+}
+\`\`\`
+
+Analysis guidelines:
+1. Choose the most appropriate chart type based on the data and query:
+   - Line charts for time series or trends
+   - Bar charts for comparing categories
+   - Pie charts for showing distribution (only for small sets, <= 7 items)
+   - Area charts for showing volume over time
+   - Scatter plots for showing correlation
+   - Multi-bar charts for comparing multiple metrics across categories
+   
+2. Select appropriate axes:
+   - For temporal data, use the date column as the X-axis
+   - For categorical comparisons, use the category as the X-axis
+   - For correlation analysis, choose the independent variable as the X-axis
+   
+3. Format the data appropriately:
+   - Don't modify the structure unless absolutely necessary
+   - For pie charts, transform data to have 'segment' and 'value' fields
+   
+4. Add proper labels, tooltips and formatting:
+   - Use human-readable labels based on the query context
+   - Add tooltips showing detailed information on hover
+   - Format numbers appropriately (currency, percentages, etc.)
+   - Add thousands separators for large numbers
+   
+5. Choose appropriate colors and styling:
+   - Use color blind-friendly palettes
+   - Ensure sufficient contrast
+   - Use colors that make sense for the data (red for negative, green for positive, etc.)
+   
+6. Add appropriate legends and annotations:
+   - Place legends in the optimal position based on the chart type
+   - Consider adding reference lines for averages/thresholds if relevant
+
+Response format:
+- Provide ONLY a valid JSON object matching the ChartData interface.
+- Do not include any explanation, only the JSON configuration.
+- Ensure the JSON is properly formatted and valid.
+- Enclose the entire response in triple backticks with the json tag.`;
+
+  try {
+    console.log("Sending chart analysis request to Claude...");
+    
+    const response = await chartGenerator.messages.create({
+      model: "claude-3-haiku-20240307", // Use a faster model for UI response time
+      max_tokens: 4000,
+      temperature: 0.2, // Lower temperature for more consistent outputs
+      messages: [
+        {
+          role: "user",
+          content: chartPrompt
+        }
+      ],
+      system: "You are a data visualization expert assistant who specializes in Recharts configurations. Your only task is to analyze data and create optimized chart configurations. You must respond ONLY with valid JSON that follows the requested schema - no explanations or additional text."
+    });
+
+    // Extract the JSON from the response
+    const responseText = response.content[0].text;
+    
+    // Logging
+    console.log("Chart generator response received");
+    
+    // Extract the JSON from the response (handling triple backticks if present)
+    let jsonString = responseText;
+    
+    // If the response is wrapped in markdown code blocks, extract just the JSON
+    const codeBlockMatch = responseText.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (codeBlockMatch && codeBlockMatch[1]) {
+      jsonString = codeBlockMatch[1];
+    }
+
+    try {
+      // Parse the JSON
+      const chartConfig = JSON.parse(jsonString.trim()) as ChartData;
+      
+      // Validate the required fields
+      if (!chartConfig.chartType || !chartConfig.data || !chartConfig.config || !chartConfig.chartConfig) {
+        throw new Error("Chart configuration is missing required fields");
+      }
+      
+      // Log the chart type selected
+      console.log(`Generated a ${chartConfig.chartType} chart configuration with ${Object.keys(chartConfig.chartConfig).length} data series`);
+      
+      // Post-process the chart configuration for UI compatibility
+      
+      // 1. Ensure chartConfig has color properties using a consistent palette
+      const colorPalette = [
+        "#3366CC", "#DC3912", "#FF9900", "#109618", "#990099", 
+        "#0099C6", "#DD4477", "#66AA00", "#B82E2E", "#316395"
+      ];
+      
+      Object.entries(chartConfig.chartConfig).forEach(([key, config], index) => {
+        if (!config.color) {
+          config.color = colorPalette[index % colorPalette.length];
+        }
+      });
+      
+      // 2. For pie charts, ensure data is in the correct format
+      if (chartConfig.chartType === 'pie' && chartConfig.data.length > 0) {
+        // Check if data needs transformation
+        if (!('segment' in chartConfig.data[0]) || !('value' in chartConfig.data[0])) {
+          const xAxisKey = chartConfig.config.xAxisKey;
+          const valueKey = Object.keys(chartConfig.data[0]).find(k => k !== xAxisKey && typeof chartConfig.data[0][k] === 'number');
+          
+          if (valueKey) {
+            chartConfig.data = chartConfig.data.map(item => ({
+              segment: item[xAxisKey],
+              value: item[valueKey]
+            }));
+            
+            // Update config
+            chartConfig.config.xAxisKey = 'segment';
+            
+            // Update chartConfig
+            chartConfig.chartConfig = {
+              [valueKey]: {
+                dataKey: 'value',
+                name: valueKey,
+                color: colorPalette[0]
+              }
+            };
+          }
+        }
+      }
+      
+      return chartConfig;
+    } catch (parseError) {
+      console.error("Failed to parse chart configuration JSON:", parseError);
+      console.error("Raw JSON string:", jsonString);
+      throw new Error("Failed to parse chart configuration from Claude");
+    }
+  } catch (error) {
+    console.error("Error generating chart with Claude:", error);
+    
+    // Fallback to a simple chart if Claude fails
+    console.log("Using fallback chart configuration");
+    
+    // Determine fallback chart type
+    let fallbackChartType = chartType || 'bar';
+    if (!chartType) {
+      if (dateColumns.length > 0 && numberColumns.length > 0) {
+        fallbackChartType = 'line';
+      } else if (numberColumns.length > 1 && stringColumns.length > 0) {
+        fallbackChartType = 'bar';
+      } else if (stringColumns.length === 1 && numberColumns.length === 1) {
+        fallbackChartType = queryData.length <= 7 ? 'pie' : 'bar';
+      }
+    }
+    
+    // Create a simple fallback configuration
+    const fallbackConfig: ChartData = {
+      chartType: fallbackChartType,
+      data: queryData,
+      config: {
+        xAxisKey: stringColumns[0] || dateColumns[0] || numberColumns[0],
+        title: `Data Analysis for "${nlQuery}"`,
+        showGrid: true,
+        showTooltip: true,
+        legendPosition: 'bottom'
+      },
+      chartConfig: {}
+    };
+    
+    // Add chart series for numeric columns (except the x-axis)
+    numberColumns.forEach((column, index) => {
+      if (column !== fallbackConfig.config.xAxisKey) {
+        fallbackConfig.chartConfig[column] = {
+          dataKey: column,
+          name: column,
+          color: colorPalette[index % colorPalette.length],
+          strokeWidth: 2
+        };
+      }
+    });
+    
+    return fallbackConfig;
+  }
+}
+
 // Add this function to check if Claude's response contains an explanation
 function needsDataExplanation(responseText, queryData) {
   // If there's no data or no text response, we can't analyze
@@ -327,7 +656,7 @@ export async function POST(req: NextRequest) {
     });
 
     // Add to system prompt that Claude should clear previous charts
-    const systemPrompt = `You are Claude, a helpful sales data analyst assistant. 
+    const systemPrompt = `You are Claude, a helpful sales data analyst assistant. Only answer based on the data provided. If you don't have the data, say I don't have the data. Always use the query_sales_data tool to get the data even if you already have the data from your previous response.
 You have access to the following tools:
 
 1. generate_graph_data: Generate visualization data for sales analysis
@@ -526,6 +855,77 @@ Remember: Your PRIMARY responsibility is to directly answer the user's question 
           if (textContent) {
             textContent.text = textResponse;
           }
+        // Add this after the closing bracket of the if (dataQueryIndex >= 0) {...} block
+    // and before the else block that handles direct generate_graph_data tool use
+
+        } else {
+          // If only generate_graph_data was used (without a database query first),
+          // we need to enhance Claude's raw chart
+          for (let i = response.content.length - 1; i >= 0; i--) {
+            const content = response.content[i];
+            if (content.type === 'tool_use' && content.name === 'generate_graph_data') {
+              console.log("🔍 Found direct visualization tool use without database query");
+              
+              try {
+                // Extract the input data and try to enhance it
+                const originalChartData = content.input;
+                const originalData = originalChartData.data;
+                
+                if (originalData && originalData.length > 0) {
+                  console.log(`Chart has ${originalData.length} data points and uses ${originalChartData.chartType} chart type`);
+                  
+                  // Try to extract a query from the text response
+                  const queryText = textContent?.text || "";
+                  let inferredQuery = "";
+                  
+                  // Look for "showing" or "here's" phrases that might indicate what the chart is about
+                  const showingMatch = queryText.match(/showing\s+([^.]+)/i);
+                  const heresMatch = queryText.match(/here['']s\s+([^.]+)/i);
+                  const displayingMatch = queryText.match(/displaying\s+([^.]+)/i);
+                  const visualizingMatch = queryText.match(/visualizing\s+([^.]+)/i);
+                  
+                  if (showingMatch) inferredQuery = showingMatch[1];
+                  else if (heresMatch) inferredQuery = heresMatch[1];
+                  else if (displayingMatch) inferredQuery = displayingMatch[1];
+                  else if (visualizingMatch) inferredQuery = visualizingMatch[1];
+                  else inferredQuery = "Sales data visualization";
+                  
+                  console.log("✨ Enhancing Claude's direct chart with optimized configuration");
+                  
+                  // Use the chart generator to create an optimized version
+                  // but keep the original data and chart type
+                  const enhancedChart = await generateOptimizedChart(
+                    originalData, 
+                    inferredQuery,
+                    originalChartData.chartType
+                  );
+                  
+                  // Preserve Claude's data choices but use the enhanced configuration
+                  // This gives us the best of both worlds - Claude's data selection
+                  // with our improved formatting, tooltips, colors, etc.
+                  toolUseContent = {
+                    ...content,
+                    input: {
+                      ...enhancedChart,
+                      data: originalData // Keep Claude's original data
+                    }
+                  };
+                  
+                  console.log("🔄 Enhanced Claude's direct chart visualization");
+                } else {
+                  // If we can't enhance it, just use Claude's original chart
+                  toolUseContent = content;
+                  console.log("⚠️ Using Claude's original chart (couldn't enhance)");
+                }
+              } catch (error) {
+                console.error("❌ Error enhancing direct chart:", error);
+                // Fall back to Claude's original chart
+                toolUseContent = content;
+              }
+              
+              break;
+            }
+          }
         }
         // Check if Claude explicitly requested a chart
         let userWantsChart = false;
@@ -697,35 +1097,68 @@ Remember: Your PRIMARY responsibility is to directly answer the user's question 
           return false;
         };
         
+        // Find this section in your code and replace it with the following updated logic
+        // (around line ~500-600, after the shouldCreateVisualization function)
+
         // Decide if we need a visualization
         const needsVisualization = shouldCreateVisualization(queryResult.data, nlQuery);
         console.log(`Query results visualization decision: ${needsVisualization ? 'Creating chart' : 'No chart needed'}`);
-        
+
+        const colorPalette = [
+          "#3366CC", "#DC3912", "#FF9900", "#109618", "#990099", 
+          "#0099C6", "#DD4477", "#66AA00", "#B82E2E", "#316395"
+        ];
+
+        // Enhanced visualization generation
         if (needsVisualization) {
-          // Prepare data for visualization
-          chartData = prepareDataForVisualization(queryResult.data, nlQuery);
-          
-          // If generate_graph_data tool was used, replace its content
-          if (graphToolIndex >= 0) {
-            toolUseContent = response.content[graphToolIndex];
-            // Overwrite the tool's input with our chart data
-            (toolUseContent as any).input = chartData;
-          } else if (chartData) {
-            // Create a synthetic tool use only if needed
-            console.log("Creating SYNTHETIC visualization because one is needed but Claude didn't create it");
-            toolUseContent = {
-              id: `tu_${Math.random().toString(36).substring(2, 9)}`,
-              type: 'tool_use',
-              name: 'generate_graph_data',
-              input: chartData
-            };
+          console.log("✨ Using enhanced chart generation");
+          try {
+            // Use the new Claude-powered chart generator
+            chartData = await generateOptimizedChart(queryResult.data, nlQuery, 
+              // Pass the suggested chart type if Claude already specified one
+              graphToolIndex >= 0 ? response.content[graphToolIndex].input.chartType : undefined
+            );
+            
+            // If generate_graph_data tool was used, replace its content
+            if (graphToolIndex >= 0) {
+              toolUseContent = response.content[graphToolIndex];
+              // Overwrite the tool's input with our enhanced chart data
+              (toolUseContent as any).input = chartData;
+              console.log("🔄 Replaced Claude's chart with enhanced version");
+            } else if (chartData) {
+              // Create a synthetic tool use only if needed
+              console.log("🆕 Creating new visualization since one is needed but wasn't created");
+              toolUseContent = {
+                id: `tu_${Math.random().toString(36).substring(2, 9)}`,
+                type: 'tool_use',
+                name: 'generate_graph_data',
+                input: chartData
+              };
+            }
+          } catch (error) {
+            console.error("❌ Enhanced chart generation failed, falling back to standard method:", error);
+            // Fall back to the existing preparation method
+            chartData = prepareDataForVisualization(queryResult.data, nlQuery);
+            
+            // Rest of your existing chart generation code...
+            if (graphToolIndex >= 0) {
+              toolUseContent = response.content[graphToolIndex];
+              (toolUseContent as any).input = chartData;
+            } else if (chartData) {
+              toolUseContent = {
+                id: `tu_${Math.random().toString(36).substring(2, 9)}`,
+                type: 'tool_use',
+                name: 'generate_graph_data',
+                input: chartData
+              };
+            }
           }
         } else {
           console.log("Skipping visualization for this query - not appropriate for a chart");
         }
       } else {
         console.log("Query returned no data or failed:", queryResult);
-      }
+      };
     } else {
       // If only generate_graph_data was used, get ONLY the LAST one
       for (let i = response.content.length - 1; i >= 0; i--) {
@@ -737,51 +1170,205 @@ Remember: Your PRIMARY responsibility is to directly answer the user's question 
       }
     }
 
-    // Process the chart data for visualization
-    const processToolResponse = (toolUseContent: any) => {
-      if (!toolUseContent || toolUseContent.name !== 'generate_graph_data') return null;
+    // Log the chart data for debugging
+    console.log("\n===== CHART DATA DETAILS =====");
+    if (toolUseContent && toolUseContent.name === 'generate_graph_data') {
+      const chartDetails = toolUseContent.input;
+      console.log(`Chart Type: ${chartDetails.chartType}`);
+      console.log(`Data Points: ${chartDetails.data?.length || 0}`);
+      console.log(`Series: ${Object.keys(chartDetails.chartConfig || {}).join(', ')}`);
+      console.log(`Config: ${JSON.stringify(chartDetails.config, null, 2)}`);
+    } else {
+      console.log("No chart data available");
+    }
+    console.log("===== END CHART DATA DETAILS =====\n");
+
+    /**
+     * Prepares chart data for the frontend by adding missing properties and normalizing the structure
+     */
+    function prepareChartDataForFrontend(chartData: any) {
+      if (!chartData) return null;
       
-      const chartData = toolUseContent.input;
+      console.log("Preparing chart data for frontend rendering...");
       
-      // For pie charts, transform data for the UI components
-      if (chartData.chartType === 'pie') {
-        // Look for pie chart specific transformations
-        const valueKey = Object.keys(chartData.data[0]).find(k => k !== chartData.config.xAxisKey);
+      // Ensure required properties exist
+      if (!chartData.chartType) {
+        console.warn("Chart missing chartType, defaulting to 'bar'");
+        chartData.chartType = 'bar';
+      }
+      
+      if (!chartData.data || !Array.isArray(chartData.data) || chartData.data.length === 0) {
+        console.warn("Chart has no data to display");
+        return null;
+      }
+      
+      if (!chartData.config) {
+        console.warn("Chart missing config, creating default");
+        chartData.config = {};
+      }
+      
+      if (!chartData.chartConfig) {
+        console.warn("Chart missing chartConfig, creating default");
+        chartData.chartConfig = {};
+      }
+      
+      // Ensure we have a title
+      if (!chartData.config.title) {
+        // Create a title based on the data structure
+        const dataFields = Object.keys(chartData.data[0]);
+        const numericFields = dataFields.filter(field => 
+          typeof chartData.data[0][field] === 'number'
+        );
         
-        if (valueKey && chartData.config.xAxisKey) {
-          chartData.data = chartData.data.map(item => {
-            return {
-              segment: item[chartData.config.xAxisKey],
-              value: item[valueKey] || item.value,
-            };
-          });
-          
-          // Ensure xAxisKey is set to 'segment' for consistency
-          chartData.config.xAxisKey = "segment";
+        const categoryFields = dataFields.filter(field => 
+          typeof chartData.data[0][field] === 'string' &&
+          !field.includes('date') &&
+          !field.includes('time')
+        );
+        
+        if (numericFields.length > 0 && categoryFields.length > 0) {
+          const metric = numericFields[0].replace(/_/g, ' ');
+          const category = categoryFields[0].replace(/_/g, ' ');
+          chartData.config.title = `${metric} by ${category}`;
+          console.log(`Generated title: ${chartData.config.title}`);
+        } else {
+          chartData.config.title = "Data Analysis";
         }
       }
+      
+      // Handle xAxisKey - critical for rendering
+      if (!chartData.config.xAxisKey) {
+        const dataFields = Object.keys(chartData.data[0]);
+        const categoryFields = dataFields.filter(field => 
+          typeof chartData.data[0][field] === 'string' &&
+          field !== 'value' &&
+          field !== 'segment'
+        );
+        
+        if (categoryFields.length > 0) {
+          chartData.config.xAxisKey = categoryFields[0];
+          console.log(`Set xAxisKey to first string field: ${chartData.config.xAxisKey}`);
+        } else {
+          // If no suitable field is found, use the first field
+          chartData.config.xAxisKey = dataFields[0];
+          console.log(`Set xAxisKey to first available field: ${chartData.config.xAxisKey}`);
+        }
+      }
+      
+      // Fix chart series configuration for bar charts
+      if (chartData.chartType === 'bar' && Object.keys(chartData.chartConfig).length === 0) {
+        // Find a numeric field to use as the data series
+        const dataFields = Object.keys(chartData.data[0]);
+        const numericFields = dataFields.filter(field => 
+          typeof chartData.data[0][field] === 'number' && 
+          field !== chartData.config.xAxisKey
+        );
+        
+        if (numericFields.length > 0) {
+          const seriesKey = numericFields[0];
+          chartData.chartConfig[seriesKey] = {
+            dataKey: seriesKey,
+            name: seriesKey.replace(/_/g, ' '),
+            color: "#3366CC"
+          };
+          console.log(`Created bar chart series for ${seriesKey}`);
+        }
+      }
+      
+      // Ensure all series have colors
+      const colorPalette = [
+        "#3366CC", "#DC3912", "#FF9900", "#109618", "#990099", 
+        "#0099C6", "#DD4477", "#66AA00", "#B82E2E", "#316395"
+      ];
+      
+      Object.entries(chartData.chartConfig).forEach(([key, config], index) => {
+        if (!config.color) {
+          (config as any).color = colorPalette[index % colorPalette.length];
+        }
+        
+        // Ensure each series has a dataKey property
+        if (!(config as any).dataKey) {
+          (config as any).dataKey = key;
+        }
+      });
+      
+      // Handle pie charts with special formatting
+      if (chartData.chartType === 'pie') {
+        // Check if data is already in the right format
+        const hasCorrectFormat = chartData.data.every(item => 
+          'segment' in item && 'value' in item
+        );
+        
+        if (!hasCorrectFormat) {
+          console.log("Reformatting pie chart data...");
+          
+          // Find appropriate fields for segment and value
+          const xAxisKey = chartData.config.xAxisKey;
+          const dataFields = Object.keys(chartData.data[0]);
+          const numericFields = dataFields.filter(field => 
+            typeof chartData.data[0][field] === 'number' && 
+            field !== xAxisKey
+          );
+          
+          if (numericFields.length > 0 && xAxisKey) {
+            const valueKey = numericFields[0];
+            
+            // Transform data
+            chartData.data = chartData.data.map(item => ({
+              segment: item[xAxisKey],
+              value: item[valueKey]
+            }));
+            
+            // Update config
+            chartData.config.xAxisKey = 'segment';
+            
+            // Update chartConfig
+            chartData.chartConfig = {
+              value: {
+                dataKey: 'value',
+                name: valueKey.replace(/_/g, ' '),
+                color: colorPalette[0]
+              }
+            };
+            
+            console.log("Pie chart data reformatted successfully");
+          }
+        }
+        
+        // Add totalLabel for pie charts if missing
+        if (!chartData.config.totalLabel) {
+          chartData.config.totalLabel = "Total";
+        }
+      }
+      
+      // Ensure there's a common dataKey in series config
+      Object.values(chartData.chartConfig).forEach((config: any) => {
+        if (!config.dataKey) {
+          const seriesKeys = Object.keys(chartData.chartConfig);
+          if (seriesKeys.length > 0) {
+            config.dataKey = seriesKeys[0];
+          }
+        }
+      });
+      
+      // Add margin if missing
+      if (!chartData.config.margin) {
+        chartData.config.margin = {
+          top: 20,
+          right: 30,
+          bottom: 50,
+          left: 60
+        };
+      }
+      
+      console.log(`Chart prepared for frontend: ${chartData.chartType} with ${chartData.data.length} data points`);
+      return chartData;
+    }
 
-      // Create new chartConfig with system color variables
-      const processedChartConfig = Object.entries(chartData.chartConfig).reduce(
-        (acc, [key, config], index) => ({
-          ...acc,
-          [key]: {
-            ...config,
-            // Assign color variables sequentially
-            color: `hsl(var(--chart-${index + 1}))`,
-          },
-        }),
-        {},
-      );
+    // Then use this function right before returning the response:
 
-      return {
-        ...chartData,
-        chartConfig: processedChartConfig,
-      };
-    };
-
-    const processedChartData = toolUseContent
-      ? processToolResponse(toolUseContent)
+    const finalChartData = toolUseContent?.input 
+      ? prepareChartDataForFrontend(toolUseContent.input)
       : null;
 
     return new Response(
@@ -789,7 +1376,7 @@ Remember: Your PRIMARY responsibility is to directly answer the user's question 
         content: textContent?.text || "",
         hasToolUse: response.content.some((c) => c.type === "tool_use") || !!toolUseContent,
         toolUse: toolUseContent,
-        chartData: processedChartData,
+        chartData: finalChartData,
         replaceChart: true,
       }),
       {
